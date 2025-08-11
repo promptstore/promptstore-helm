@@ -1,0 +1,1540 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "{{ .Values.appname }}"
+  namespace: "{{ .Values.namespace }}"
+spec:
+  selector:
+    matchLabels:
+      app: api
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      {{ if .Values.imagePullSecret }}
+      imagePullSecrets:
+        - name: "{{ .Values.imagePullSecret }}"
+      {{ end }}
+      initContainers:
+        - name: db-init
+          image: postgres:14
+          command: ["/bin/bash"]
+          args:
+            - -c
+            - |
+              set -e  # Exit on any error
+              set -o pipefail  # Exit on pipe failures
+              
+              # Error handling function
+              handle_error() {
+                local exit_code=$?
+                local line_number=$1
+                echo "ERROR: Script failed with exit code $exit_code at line $line_number"
+                echo "Command that failed: $BASH_COMMAND"
+                echo "Environment variables:"
+                echo "  PGHOST: $PGHOST"
+                echo "  PGPORT: $PGPORT" 
+                echo "  PGDATABASE: $PGDATABASE"
+                echo "  PGUSER: $PGUSER"
+                exit $exit_code
+              }
+              
+              # Set up error trap
+              trap 'handle_error $LINENO' ERR
+              
+              echo "Checking if database initialization is needed..."
+              
+              # Wait for database to be ready (max 5 minutes)
+              echo "Waiting for database to be ready..."
+              READINESS_TIMEOUT=300
+              READINESS_ELAPSED=0
+              while ! pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE"; do
+                if [ $READINESS_ELAPSED -ge $READINESS_TIMEOUT ]; then
+                  echo "ERROR: Database readiness check timed out after ${READINESS_TIMEOUT} seconds"
+                  exit 1
+                fi
+                echo "Database not ready yet (${READINESS_ELAPSED}s elapsed)..."
+                sleep 5
+                READINESS_ELAPSED=$((READINESS_ELAPSED + 5))
+              done
+              echo "Database is ready!"
+              
+              # Test actual database connection (max 2 minutes)
+              echo "Testing database connection..."
+              CONNECTION_TIMEOUT=120
+              CONNECTION_ELAPSED=0
+              while ! psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -c "SELECT 1;" > /dev/null 2>&1; do
+                if [ $CONNECTION_ELAPSED -ge $CONNECTION_TIMEOUT ]; then
+                  echo "ERROR: Database connection test timed out after ${CONNECTION_TIMEOUT} seconds"
+                  echo "Please check database credentials and network connectivity"
+                  exit 1
+                fi
+                echo "Database connection test failed, retrying... (${CONNECTION_ELAPSED}s elapsed)"
+                sleep 5
+                CONNECTION_ELAPSED=$((CONNECTION_ELAPSED + 5))
+              done
+              echo "Database connection successful!"
+              
+              # Copy and make the template processing script executable
+              echo "Setting up template processing script..."
+              cp /init-scripts/process_template.sh /tmp/process_template.sh
+              chmod +x /tmp/process_template.sh
+              
+              # Check if tables exist
+              echo "Checking existing database state..."
+              if ! TABLE_COUNT=$(psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE';" 2>/dev/null); then
+                echo "WARNING: Could not query table count, assuming empty database"
+                TABLE_COUNT="0"
+              fi
+              
+              TABLE_COUNT=$(echo $TABLE_COUNT | tr -d ' ')  # Remove whitespace
+              echo "Found $TABLE_COUNT tables in database"
+              
+              {{ if .Values.dbInit.dropTables }}
+              echo "DROP_TABLES flag is enabled. Force recreating database..."
+              FORCE_INIT=true
+              {{ else }}
+              FORCE_INIT=false
+              {{ end }}
+              
+              if [ "$TABLE_COUNT" -eq 0 ] || [ "$FORCE_INIT" = "true" ]; then
+                if [ "$FORCE_INIT" = "true" ]; then
+                  echo "Force initializing database (will drop and recreate tables)..."
+                else
+                  echo "No tables found. Initializing database..."
+                fi
+                
+                # Initialize database with SQL files in order
+                echo "Creating extensions..."
+                if ! /tmp/process_template.sh /init-scripts/002_create_extensions.sql | psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE; then
+                  echo "ERROR: Failed to create extensions"
+                  exit 1
+                fi
+                
+                echo "Creating tables..."
+                if ! /tmp/process_template.sh /init-scripts/003_create_tables.sql | psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE; then
+                  echo "ERROR: Failed to create tables"
+                  exit 1
+                fi
+                
+                echo "Creating helper functions..."
+                if ! /tmp/process_template.sh /init-scripts/005_create_helper_functions.sql | psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE; then
+                  echo "ERROR: Failed to create helper functions"
+                  exit 1
+                fi
+                
+                echo "Inserting fixtures..."
+                if ! /tmp/process_template.sh /init-scripts/006_insert_fixtures.sql | psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE; then
+                  echo "ERROR: Failed to insert fixtures"
+                  exit 1
+                fi
+                
+                echo "Database initialization completed successfully!"
+              else
+                echo "Database already initialized (found $TABLE_COUNT tables). Skipping initialization."
+              fi
+          env:
+            - name: PGHOST
+              valueFrom:
+                configMapKeyRef:
+                  key: PGHOST
+                  name: "{{ .Values.appname }}"
+            - name: PGPORT
+              valueFrom:
+                configMapKeyRef:
+                  key: PGPORT
+                  name: "{{ .Values.appname }}"
+            - name: PGDATABASE
+              valueFrom:
+                configMapKeyRef:
+                  key: PGDATABASE
+                  name: "{{ .Values.appname }}"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  key: PGUSER
+                  name: "{{ .Values.appname }}"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: PGPASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: TEMPLATE_OPEN
+              value: "||"
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /init-scripts
+              readOnly: true
+      containers:
+        - name: api
+          image: "{{ .Values.containerRegistry }}/{{ .Values.appname }}:{{ .Values.version }}"
+          env:
+            - name: ENV
+              valueFrom:
+                configMapKeyRef:
+                  key: ENV
+                  name: "{{ .Values.appname }}"
+            - name: FILE_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  key: FILE_BUCKET
+                  name: "{{ .Values.appname }}"
+            - name: DOCUMENTS_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  key: DOCUMENTS_PREFIX
+                  name: "{{ .Values.appname }}"
+            - name: IMAGES_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  key: IMAGES_PREFIX
+                  name: "{{ .Values.appname }}"
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  key: PORT
+                  name: "{{ .Values.appname }}"
+            - name: BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: BASE_URL
+                  name: "{{ .Values.appname }}"
+            - name: PGHOST
+              valueFrom:
+                configMapKeyRef:
+                  key: PGHOST
+                  name: "{{ .Values.appname }}"
+            - name: PGPORT
+              valueFrom:
+                configMapKeyRef:
+                  key: PGPORT
+                  name: "{{ .Values.appname }}"
+            - name: PGDATABASE
+              valueFrom:
+                configMapKeyRef:
+                  key: PGDATABASE
+                  name: "{{ .Values.appname }}"
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  key: REDIS_HOST
+                  name: "{{ .Values.appname }}"
+            - name: S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  key: S3_ENDPOINT
+                  name: "{{ .Values.appname }}"
+            - name: S3_PORT
+              valueFrom:
+                configMapKeyRef:
+                  key: S3_PORT
+                  name: "{{ .Values.appname }}"
+            - name: TEMPORAL_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: TEMPORAL_URL
+                  name: "{{ .Values.appname }}"
+            - name: TEMPORAL_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  key: TEMPORAL_NAMESPACE
+                  name: "{{ .Values.appname }}"
+            - name: TEMPORAL_TLS
+              valueFrom:
+                configMapKeyRef:
+                  key: TEMPORAL_TLS
+                  name: "{{ .Values.appname }}"
+            - name: LOKI_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: LOKI_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: EMBEDDING_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: EMBEDDING_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: EXTRACTOR_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: EXTRACTOR_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: FEATURE_STORE_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: FEATURE_STORE_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: GRAPH_STORE_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: GRAPH_STORE_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: GUARDRAIL_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: GUARDRAIL_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: LLM_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: LLM_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: LOADER_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: LOADER_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: METRIC_STORE_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: METRIC_STORE_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: MODEL_PROVIDER_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: MODEL_PROVIDER_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: OUTPUT_PARSER_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: OUTPUT_PARSER_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: PASSPORT_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: PASSPORT_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: SQL_SOURCE_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: SQL_SOURCE_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: TOOL_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: TOOL_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: VECTOR_STORE_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: VECTOR_STORE_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: ANAML_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: ANAML_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_HOST
+              valueFrom:
+                configMapKeyRef:
+                  key: NEO4J_HOST
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_PORT
+              valueFrom:
+                configMapKeyRef:
+                  key: NEO4J_PORT
+                  name: "{{ .Values.appname }}"
+            - name: EUROPA_PII_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: EUROPA_PII_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: HUGGINGFACE_PII_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: HUGGINGFACE_PII_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_DRIVE_REDIRECT_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: GOOGLE_DRIVE_REDIRECT_URL
+                  name: "{{ .Values.appname }}"
+            - name: ONESOURCE_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: ONESOURCE_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: S3_REGION
+              valueFrom:
+                configMapKeyRef:
+                  key: S3_REGION
+                  name: "{{ .Values.appname }}"
+            - name: UNSTRUCTURED_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: UNSTRUCTURED_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: HUGGINGFACE_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: HUGGINGFACE_BASE_URL
+                  name: "{{ .Values.appname }}"
+            - name: HUGGINGFACE_HUB_API
+              valueFrom:
+                configMapKeyRef:
+                  key: HUGGINGFACE_HUB_API
+                  name: "{{ .Values.appname }}"
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  key: AWS_REGION
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_PROJECT_ID
+              valueFrom:
+                configMapKeyRef:
+                  key: GOOGLE_PROJECT_ID
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_PROJECT_LOCATION
+              valueFrom:
+                configMapKeyRef:
+                  key: GOOGLE_PROJECT_LOCATION
+                  name: "{{ .Values.appname }}"
+            - name: GCS_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  key: GCS_BUCKET
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_LEARNLM_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: GOOGLE_LEARNLM_URL
+                  name: "{{ .Values.appname }}"
+            - name: GPT4ALL_API
+              valueFrom:
+                configMapKeyRef:
+                  key: GPT4ALL_API
+                  name: "{{ .Values.appname }}"
+            - name: PALM2_MODEL_NAME
+              valueFrom:
+                configMapKeyRef:
+                  key: PALM2_MODEL_NAME
+                  name: "{{ .Values.appname }}"
+            - name: LLAMA2_BASE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  key: LLAMA2_BASE_PATH
+                  name: "{{ .Values.appname }}"
+            - name: LLAMAAPI_BASE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  key: LLAMAAPI_BASE_PATH
+                  name: "{{ .Values.appname }}"
+            - name: LOCALAI_BASE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  key: LOCALAI_BASE_PATH
+                  name: "{{ .Values.appname }}"
+            - name: MISTRAL_API
+              valueFrom:
+                configMapKeyRef:
+                  key: MISTRAL_API
+                  name: "{{ .Values.appname }}"
+            - name: KEYCLOAK_HOST
+              valueFrom:
+                configMapKeyRef:
+                  key: KEYCLOAK_HOST
+                  name: "{{ .Values.appname }}"
+            - name: KEYCLOAK_CALLBACK
+              valueFrom:
+                configMapKeyRef:
+                  key: KEYCLOAK_CALLBACK
+                  name: "{{ .Values.appname }}"
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  key: KEYCLOAK_REALM
+                  name: "{{ .Values.appname }}"
+            - name: KEYCLOAK_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  key: KEYCLOAK_CLIENT_ID
+                  name: "{{ .Values.appname }}"
+            - name: TOKEN_STORE_KEY
+              valueFrom:
+                configMapKeyRef:
+                  key: TOKEN_STORE_KEY
+                  name: "{{ .Values.appname }}"
+            - name: JIRA_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: JIRA_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: JIRA_PROJECT_KEY
+              valueFrom:
+                configMapKeyRef:
+                  key: JIRA_PROJECT_KEY
+                  name: "{{ .Values.appname }}"
+            - name: WORKSPACE_ID
+              valueFrom:
+                configMapKeyRef:
+                  key: WORKSPACE_ID
+                  name: "{{ .Values.appname }}"
+            - name: SERPAPI_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: SERPAPI_URL
+                  name: "{{ .Values.appname }}"
+            - name: CHROMA_SERVER
+              valueFrom:
+                configMapKeyRef:
+                  key: CHROMA_SERVER
+                  name: "{{ .Values.appname }}"
+            - name: ES_SERVER
+              valueFrom:
+                configMapKeyRef:
+                  key: ES_SERVER
+                  name: "{{ .Values.appname }}"
+            - name: ES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  key: ES_PORT
+                  name: "{{ .Values.appname }}"
+            - name: ES_SSL
+              valueFrom:
+                configMapKeyRef:
+                  key: ES_SSL
+                  name: "{{ .Values.appname }}"
+            - name: ES_USER
+              valueFrom:
+                configMapKeyRef:
+                  key: ES_USER
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_VECTOR_STORE_HOST
+              valueFrom:
+                configMapKeyRef:
+                  key: NEO4J_VECTOR_STORE_HOST
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_VECTOR_STORE_PORT
+              valueFrom:
+                configMapKeyRef:
+                  key: NEO4J_VECTOR_STORE_PORT
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_API
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_API
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_EMBEDDING_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_EMBEDDING_PROVIDER
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_INDEX_NAME
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_INDEX_NAME
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_NODE_LABEL
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_NODE_LABEL
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_WORKSPACE
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_WORKSPACE
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_VECTORSTORE_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_VECTORSTORE_PROVIDER
+                  name: "{{ .Values.appname }}"
+            - name: RULES_ENGINE_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: RULES_ENGINE_SERVICE_URL
+                  name: "{{ .Values.appname }}"
+            - name: SYSTEM_WORKSPACE_ID
+              valueFrom:
+                configMapKeyRef:
+                  key: SYSTEM_WORKSPACE_ID
+                  name: "{{ .Values.appname }}"
+            - name: NO_AUTH
+              valueFrom:
+                configMapKeyRef:
+                  key: NO_AUTH
+                  name: "{{ .Values.appname }}"
+            - name: MINIMAL_INSTALL
+              valueFrom:
+                configMapKeyRef:
+                  key: MINIMAL_INSTALL
+                  name: "{{ .Values.appname }}"
+
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  key: PGUSER
+                  name: "{{ .Values.appname }}"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: PGPASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: REDIS_PASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: AWS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_ACCESS_KEY
+                  name: "{{ .Values.appname }}"
+            - name: AWS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_SECRET_KEY
+                  name: "{{ .Values.appname }}"
+            - name: ANAML_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: ANAML_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: ANAML_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: ANAML_API_SECRET
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: NEO4J_USERNAME
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: NEO4J_PASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: ATLASSIAN_DOMAIN
+              valueFrom:
+                secretKeyRef:
+                  key: ATLASSIAN_DOMAIN
+                  name: "{{ .Values.appname }}"
+            - name: ATLASSIAN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: ATLASSIAN_USERNAME
+                  name: "{{ .Values.appname }}"
+            - name: ATLASSIAN_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: ATLASSIAN_API_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_DRIVE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_DRIVE_CLIENT_ID
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_DRIVE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_DRIVE_CLIENT_SECRET
+                  name: "{{ .Values.appname }}"
+            - name: NOTION_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: NOTION_API_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  key: S3_ACCESS_KEY_ID
+                  name: "{{ .Values.appname }}"
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: S3_SECRET_ACCESS_KEY
+                  name: "{{ .Values.appname }}"
+            - name: HUGGINGFACE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: HUGGINGFACE_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: ANTHROPIC_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_ACCESS_KEY_ID
+                  name: "{{ .Values.appname }}"
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_SECRET_ACCESS_KEY
+                  name: "{{ .Values.appname }}"
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_SESSION_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: COHERE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: COHERE_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_APPLICATION_CREDENTIALS
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_GEMINI_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: LLAMAAPI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: LLAMAAPI_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: MISTRAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: MISTRAL_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: OPENAI_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: STABILITY_AI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: STABILITY_AI_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: METRICFLOW_ENVIRONMENT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: METRICFLOW_ENVIRONMENT_ID
+                  name: "{{ .Values.appname }}"
+            - name: METRICFLOW_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: METRICFLOW_SERVICE_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: KEYCLOAK_CLIENT_SECRET
+                  name: "{{ .Values.appname }}"
+            - name: PROMPTSTORE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: PROMPTSTORE_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: PROJECT_ID
+                  name: "{{ .Values.appname }}"
+            - name: KEY_FILENAME
+              valueFrom:
+                secretKeyRef:
+                  key: KEY_FILENAME
+                  name: "{{ .Values.appname }}"
+            - name: JIRA_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  key: JIRA_EMAIL
+                  name: "{{ .Values.appname }}"
+            - name: JIRA_PAT
+              valueFrom:
+                secretKeyRef:
+                  key: JIRA_PAT
+                  name: "{{ .Values.appname }}"
+            - name: MAILTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: MAILTRAP_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: SENDER_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  key: SENDER_EMAIL
+                  name: "{{ .Values.appname }}"
+            - name: PROMPTSTORE_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  key: PROMPTSTORE_EMAIL
+                  name: "{{ .Values.appname }}"
+            - name: MAILTRAP_TEMPLATE_UUID
+              valueFrom:
+                secretKeyRef:
+                  key: MAILTRAP_TEMPLATE_UUID
+                  name: "{{ .Values.appname }}"
+            - name: MAILTRAP_INVITE_TEMPLATE_UUID
+              valueFrom:
+                secretKeyRef:
+                  key: MAILTRAP_INVITE_TEMPLATE_UUID
+                  name: "{{ .Values.appname }}"
+            - name: OPENWEATHER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: OPENWEATHER_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: SERPAPI_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: SERPAPI_KEY
+                  name: "{{ .Values.appname }}"
+            - name: TRELLO_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: TRELLO_API_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: CHROMA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: CHROMA_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: ES_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: ES_PASS
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_VECTOR_STORE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: NEO4J_VECTOR_STORE_USERNAME
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_VECTOR_STORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: NEO4J_VECTOR_STORE_PASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: EMAIL_OVERRIDE
+              valueFrom:
+                secretKeyRef:
+                  key: EMAIL_OVERRIDE
+                  name: "{{ .Values.appname }}"
+            - name: CLICKHOUSE_URL
+              valueFrom:
+                secretKeyRef:
+                  key: CLICKHOUSE_URL
+                  name: "{{ .Values.appname }}"
+            - name: CLICKHOUSE_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  key: CLICKHOUSE_DATABASE
+                  name: "{{ .Values.appname }}"
+            - name: CLICKHOUSE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: CLICKHOUSE_USERNAME
+                  name: "{{ .Values.appname }}"
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: CLICKHOUSE_PASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: TEMPORAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: TEMPORAL_API_KEY
+                  name: "{{ .Values.appname }}"
+          volumeMounts:
+            - mountPath: /var/data
+              name: file-storage
+
+        - name: worker
+          image: "{{ .Values.containerRegistry }}/{{ .Values.appname }}:{{ .Values.version }}"
+          command: ["node"]
+          args: ["--loader", "ts-node/esm", "workflow/worker.js"]
+          env:
+            - name: NODE_OPTIONS
+              value: "--experimental-modules --es-module-specifier-resolution=node"
+            - name: ENV
+              valueFrom:
+                configMapKeyRef:
+                  key: ENV
+                  name: "{{ .Values.appname }}"
+            - name: FILE_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  key: FILE_BUCKET
+                  name: "{{ .Values.appname }}"
+            - name: DOCUMENTS_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  key: DOCUMENTS_PREFIX
+                  name: "{{ .Values.appname }}"
+            - name: IMAGES_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  key: IMAGES_PREFIX
+                  name: "{{ .Values.appname }}"
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  key: PORT
+                  name: "{{ .Values.appname }}"
+            - name: BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: BASE_URL
+                  name: "{{ .Values.appname }}"
+            - name: PGHOST
+              valueFrom:
+                configMapKeyRef:
+                  key: PGHOST
+                  name: "{{ .Values.appname }}"
+            - name: PGPORT
+              valueFrom:
+                configMapKeyRef:
+                  key: PGPORT
+                  name: "{{ .Values.appname }}"
+            - name: PGDATABASE
+              valueFrom:
+                configMapKeyRef:
+                  key: PGDATABASE
+                  name: "{{ .Values.appname }}"
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  key: REDIS_HOST
+                  name: "{{ .Values.appname }}"
+            - name: S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  key: S3_ENDPOINT
+                  name: "{{ .Values.appname }}"
+            - name: S3_PORT
+              valueFrom:
+                configMapKeyRef:
+                  key: S3_PORT
+                  name: "{{ .Values.appname }}"
+            - name: TEMPORAL_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: TEMPORAL_URL
+                  name: "{{ .Values.appname }}"
+            - name: TEMPORAL_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  key: TEMPORAL_NAMESPACE
+                  name: "{{ .Values.appname }}"
+            - name: TEMPORAL_TLS
+              valueFrom:
+                configMapKeyRef:
+                  key: TEMPORAL_TLS
+                  name: "{{ .Values.appname }}"
+            - name: LOKI_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: LOKI_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: EMBEDDING_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: EMBEDDING_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: EXTRACTOR_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: EXTRACTOR_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: FEATURE_STORE_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: FEATURE_STORE_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: GRAPH_STORE_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: GRAPH_STORE_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: GUARDRAIL_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: GUARDRAIL_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: LLM_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: LLM_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: LOADER_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: LOADER_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: METRIC_STORE_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: METRIC_STORE_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: MODEL_PROVIDER_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: MODEL_PROVIDER_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: OUTPUT_PARSER_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: OUTPUT_PARSER_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: PASSPORT_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: PASSPORT_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: SQL_SOURCE_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: SQL_SOURCE_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: TOOL_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: TOOL_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: VECTOR_STORE_PLUGINS
+              valueFrom:
+                configMapKeyRef:
+                  key: VECTOR_STORE_PLUGINS
+                  name: "{{ .Values.appname }}"
+            - name: ANAML_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: ANAML_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_HOST
+              valueFrom:
+                configMapKeyRef:
+                  key: NEO4J_HOST
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_PORT
+              valueFrom:
+                configMapKeyRef:
+                  key: NEO4J_PORT
+                  name: "{{ .Values.appname }}"
+            - name: EUROPA_PII_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: EUROPA_PII_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: HUGGINGFACE_PII_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: HUGGINGFACE_PII_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_DRIVE_REDIRECT_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: GOOGLE_DRIVE_REDIRECT_URL
+                  name: "{{ .Values.appname }}"
+            - name: ONESOURCE_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: ONESOURCE_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: S3_REGION
+              valueFrom:
+                configMapKeyRef:
+                  key: S3_REGION
+                  name: "{{ .Values.appname }}"
+            - name: UNSTRUCTURED_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: UNSTRUCTURED_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: HUGGINGFACE_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: HUGGINGFACE_BASE_URL
+                  name: "{{ .Values.appname }}"
+            - name: HUGGINGFACE_HUB_API
+              valueFrom:
+                configMapKeyRef:
+                  key: HUGGINGFACE_HUB_API
+                  name: "{{ .Values.appname }}"
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  key: AWS_REGION
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_PROJECT_ID
+              valueFrom:
+                configMapKeyRef:
+                  key: GOOGLE_PROJECT_ID
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_PROJECT_LOCATION
+              valueFrom:
+                configMapKeyRef:
+                  key: GOOGLE_PROJECT_LOCATION
+                  name: "{{ .Values.appname }}"
+            - name: GCS_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  key: GCS_BUCKET
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_LEARNLM_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: GOOGLE_LEARNLM_URL
+                  name: "{{ .Values.appname }}"
+            - name: GPT4ALL_API
+              valueFrom:
+                configMapKeyRef:
+                  key: GPT4ALL_API
+                  name: "{{ .Values.appname }}"
+            - name: PALM2_MODEL_NAME
+              valueFrom:
+                configMapKeyRef:
+                  key: PALM2_MODEL_NAME
+                  name: "{{ .Values.appname }}"
+            - name: LLAMA2_BASE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  key: LLAMA2_BASE_PATH
+                  name: "{{ .Values.appname }}"
+            - name: LLAMAAPI_BASE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  key: LLAMAAPI_BASE_PATH
+                  name: "{{ .Values.appname }}"
+            - name: LOCALAI_BASE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  key: LOCALAI_BASE_PATH
+                  name: "{{ .Values.appname }}"
+            - name: MISTRAL_API
+              valueFrom:
+                configMapKeyRef:
+                  key: MISTRAL_API
+                  name: "{{ .Values.appname }}"
+            - name: KEYCLOAK_HOST
+              valueFrom:
+                configMapKeyRef:
+                  key: KEYCLOAK_HOST
+                  name: "{{ .Values.appname }}"
+            - name: KEYCLOAK_CALLBACK
+              valueFrom:
+                configMapKeyRef:
+                  key: KEYCLOAK_CALLBACK
+                  name: "{{ .Values.appname }}"
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  key: KEYCLOAK_REALM
+                  name: "{{ .Values.appname }}"
+            - name: KEYCLOAK_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  key: KEYCLOAK_CLIENT_ID
+                  name: "{{ .Values.appname }}"
+            - name: TOKEN_STORE_KEY
+              valueFrom:
+                configMapKeyRef:
+                  key: TOKEN_STORE_KEY
+                  name: "{{ .Values.appname }}"
+            - name: JIRA_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: JIRA_API_URL
+                  name: "{{ .Values.appname }}"
+            - name: JIRA_PROJECT_KEY
+              valueFrom:
+                configMapKeyRef:
+                  key: JIRA_PROJECT_KEY
+                  name: "{{ .Values.appname }}"
+            - name: WORKSPACE_ID
+              valueFrom:
+                configMapKeyRef:
+                  key: WORKSPACE_ID
+                  name: "{{ .Values.appname }}"
+            - name: SERPAPI_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: SERPAPI_URL
+                  name: "{{ .Values.appname }}"
+            - name: CHROMA_SERVER
+              valueFrom:
+                configMapKeyRef:
+                  key: CHROMA_SERVER
+                  name: "{{ .Values.appname }}"
+            - name: ES_SERVER
+              valueFrom:
+                configMapKeyRef:
+                  key: ES_SERVER
+                  name: "{{ .Values.appname }}"
+            - name: ES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  key: ES_PORT
+                  name: "{{ .Values.appname }}"
+            - name: ES_SSL
+              valueFrom:
+                configMapKeyRef:
+                  key: ES_SSL
+                  name: "{{ .Values.appname }}"
+            - name: ES_USER
+              valueFrom:
+                configMapKeyRef:
+                  key: ES_USER
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_VECTOR_STORE_HOST
+              valueFrom:
+                configMapKeyRef:
+                  key: NEO4J_VECTOR_STORE_HOST
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_VECTOR_STORE_PORT
+              valueFrom:
+                configMapKeyRef:
+                  key: NEO4J_VECTOR_STORE_PORT
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_API
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_API
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_EMBEDDING_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_EMBEDDING_PROVIDER
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_INDEX_NAME
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_INDEX_NAME
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_NODE_LABEL
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_NODE_LABEL
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_WORKSPACE
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_WORKSPACE
+                  name: "{{ .Values.appname }}"
+            - name: SEARCH_VECTORSTORE_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  key: SEARCH_VECTORSTORE_PROVIDER
+                  name: "{{ .Values.appname }}"
+            - name: RULES_ENGINE_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  key: RULES_ENGINE_SERVICE_URL
+                  name: "{{ .Values.appname }}"
+            - name: SYSTEM_WORKSPACE_ID
+              valueFrom:
+                configMapKeyRef:
+                  key: SYSTEM_WORKSPACE_ID
+                  name: "{{ .Values.appname }}"
+            - name: NO_AUTH
+              valueFrom:
+                configMapKeyRef:
+                  key: NO_AUTH
+                  name: "{{ .Values.appname }}"
+            - name: MINIMAL_INSTALL
+              valueFrom:
+                configMapKeyRef:
+                  key: MINIMAL_INSTALL
+                  name: "{{ .Values.appname }}"
+
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  key: PGUSER
+                  name: "{{ .Values.appname }}"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: PGPASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: REDIS_PASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: AWS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_ACCESS_KEY
+                  name: "{{ .Values.appname }}"
+            - name: AWS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_SECRET_KEY
+                  name: "{{ .Values.appname }}"
+            - name: ANAML_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: ANAML_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: ANAML_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: ANAML_API_SECRET
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: NEO4J_USERNAME
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: NEO4J_PASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: ATLASSIAN_DOMAIN
+              valueFrom:
+                secretKeyRef:
+                  key: ATLASSIAN_DOMAIN
+                  name: "{{ .Values.appname }}"
+            - name: ATLASSIAN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: ATLASSIAN_USERNAME
+                  name: "{{ .Values.appname }}"
+            - name: ATLASSIAN_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: ATLASSIAN_API_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_DRIVE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_DRIVE_CLIENT_ID
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_DRIVE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_DRIVE_CLIENT_SECRET
+                  name: "{{ .Values.appname }}"
+            - name: NOTION_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: NOTION_API_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  key: S3_ACCESS_KEY_ID
+                  name: "{{ .Values.appname }}"
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: S3_SECRET_ACCESS_KEY
+                  name: "{{ .Values.appname }}"
+            - name: HUGGINGFACE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: HUGGINGFACE_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: ANTHROPIC_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_ACCESS_KEY_ID
+                  name: "{{ .Values.appname }}"
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_SECRET_ACCESS_KEY
+                  name: "{{ .Values.appname }}"
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_SESSION_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: COHERE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: COHERE_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_APPLICATION_CREDENTIALS
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_GEMINI_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: LLAMAAPI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: LLAMAAPI_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: MISTRAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: MISTRAL_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: OPENAI_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: STABILITY_AI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: STABILITY_AI_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: GOOGLE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: METRICFLOW_ENVIRONMENT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: METRICFLOW_ENVIRONMENT_ID
+                  name: "{{ .Values.appname }}"
+            - name: METRICFLOW_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: METRICFLOW_SERVICE_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: KEYCLOAK_CLIENT_SECRET
+                  name: "{{ .Values.appname }}"
+            - name: PROMPTSTORE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: PROMPTSTORE_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: PROJECT_ID
+                  name: "{{ .Values.appname }}"
+            - name: KEY_FILENAME
+              valueFrom:
+                secretKeyRef:
+                  key: KEY_FILENAME
+                  name: "{{ .Values.appname }}"
+            - name: JIRA_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  key: JIRA_EMAIL
+                  name: "{{ .Values.appname }}"
+            - name: JIRA_PAT
+              valueFrom:
+                secretKeyRef:
+                  key: JIRA_PAT
+                  name: "{{ .Values.appname }}"
+            - name: MAILTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: MAILTRAP_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: SENDER_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  key: SENDER_EMAIL
+                  name: "{{ .Values.appname }}"
+            - name: PROMPTSTORE_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  key: PROMPTSTORE_EMAIL
+                  name: "{{ .Values.appname }}"
+            - name: MAILTRAP_TEMPLATE_UUID
+              valueFrom:
+                secretKeyRef:
+                  key: MAILTRAP_TEMPLATE_UUID
+                  name: "{{ .Values.appname }}"
+            - name: MAILTRAP_INVITE_TEMPLATE_UUID
+              valueFrom:
+                secretKeyRef:
+                  key: MAILTRAP_INVITE_TEMPLATE_UUID
+                  name: "{{ .Values.appname }}"
+            - name: OPENWEATHER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: OPENWEATHER_API_KEY
+                  name: "{{ .Values.appname }}"
+            - name: SERPAPI_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: SERPAPI_KEY
+                  name: "{{ .Values.appname }}"
+            - name: TRELLO_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: TRELLO_API_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: CHROMA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: CHROMA_TOKEN
+                  name: "{{ .Values.appname }}"
+            - name: ES_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: ES_PASS
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_VECTOR_STORE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: NEO4J_VECTOR_STORE_USERNAME
+                  name: "{{ .Values.appname }}"
+            - name: NEO4J_VECTOR_STORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: NEO4J_VECTOR_STORE_PASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: EMAIL_OVERRIDE
+              valueFrom:
+                secretKeyRef:
+                  key: EMAIL_OVERRIDE
+                  name: "{{ .Values.appname }}"
+            - name: CLICKHOUSE_URL
+              valueFrom:
+                secretKeyRef:
+                  key: CLICKHOUSE_URL
+                  name: "{{ .Values.appname }}"
+            - name: CLICKHOUSE_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  key: CLICKHOUSE_DATABASE
+                  name: "{{ .Values.appname }}"
+            - name: CLICKHOUSE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: CLICKHOUSE_USERNAME
+                  name: "{{ .Values.appname }}"
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: CLICKHOUSE_PASSWORD
+                  name: "{{ .Values.appname }}"
+            - name: TEMPORAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: TEMPORAL_API_KEY
+                  name: "{{ .Values.appname }}"
+          volumeMounts:
+            - mountPath: /var/data
+              name: file-storage
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: "{{ .Values.appname }}-init-scripts"
+        - name: file-storage
+          persistentVolumeClaim:
+            claimName: file-storage-pvc
+        # - name: service-account
+        #   secret:
+        #     secretName: "{{ .Values.serviceAccountSecret }}"

@@ -1,0 +1,330 @@
+appname: "promptstore"
+namespace: "promptstore"
+
+file_bucket: "promptstore"
+documents_prefix: "documents"
+images_prefix: "images"
+filestore_prefix: ""
+system_workspace_id: "1"
+
+imagePullSecret: ""
+containerRegistry: "docker.io/markmo"
+serviceAccountSecret: ""
+
+version: "0.7.49"
+
+port: "5000"
+
+base_url: 
+
+env: "prod"
+
+no_auth: "true"
+minimal_install: "true"
+
+# Database initialization options
+dbInit:
+  dropTables: false  # Set to true to drop and recreate all tables (DANGEROUS - data loss!)
+
+promptstore:
+  email:
+  search_embedding_model:
+  search_embedding_provider:
+  search_index_name: "pssearch"
+  search_node_label: "Object"
+  search_workspace: "1"
+  search_embedding_model:
+  search_vectorstore_provider:
+
+ingress:
+  domain:
+  gateway: "promptstore-gateway"
+  virtualservice_namespace: "promptstore"
+
+# PostgreSQL Metastore
+db:
+  host: "postgres-postgresql.pgdatabase.svc.cluster.local"
+  name: "promptstore"
+  user: "psadmin"
+  pass: "changeme"
+
+elasticsearch:
+  host:
+  port: "9200"
+  use_ssl:
+  username:
+  password:
+
+# Redis
+redis:
+  host: "redis-master.redis.svc.cluster.local"
+  pass: changeme
+
+# MinIO filestore
+s3:
+  endpoint:
+  access_key:
+  secret_key:
+  region: "us-east-1"
+
+# Background job processing
+temporal:
+  api_url: "temporal-frontend.temporal.svc.cluster.local:7233"
+  namespace: "promptstore"
+
+# Log aggregator
+loki:
+  api_url: ""
+
+########
+
+## PLUGINS ########
+
+plugins:
+  embeddings:
+  extractors:
+  feature_stores:
+  graph_stores:
+  guardrails: "emojiremover|Emoji Remover|./plugins/guardrails/emojiremover|type=output"
+  llm: ""
+  loaders:
+  metric_stores:
+  model_providers:
+  output_parsers: "numberedlist|Numbered List|./plugins/outputparsers/numberedlist,list|Inline List|./plugins/outputparsers/list,json|Parse or fix JSON|./plugins/outputparsers/json,boolean|Boolean|./plugins/outputparsers/boolean,datetime|DateTime|./plugins/outputparsers/datetime,action|Action|./plugins/outputparsers/action"
+  passport: "localapikey|Local API Key|./plugins/passport/localapikey"
+  sql_sources:
+  tools: "calculator|Calculator|./plugins/tools/calculator"
+  vector_stores:
+
+########
+
+## PLUGIN SETTINGS ########
+
+## Feature store plugins ########
+
+# Anaml
+anaml:
+  api_url:
+  api_key:
+  api_secret:
+
+########
+
+## Graph store plugins ########
+graph_stores:
+
+  # Neo4j
+  neo4j:
+    host:
+    username:
+    password:
+
+########
+
+## Guardrail plugins ########
+
+# PII Guardrail
+custom_models:
+  europa_pii_api_url:
+
+########
+
+## Loader plugins ########
+
+# Confluence
+atlassian:
+  domain:
+  username:
+  api_token:
+
+# Google Drive
+googledrive:
+  client_id:
+  client_secret:
+  redirect_url: "https://<promptstore-domain>/auth/google/callback"
+
+# Notion
+notion:
+  api_token:
+
+# Onesource
+onesource:
+  api_url:
+
+# AWS S3
+aws_s3:
+  region:
+  access_key_id:
+  secret_acccess_key:
+
+# Unstructured
+unstructured:
+  api_url:
+
+########
+
+## Model provider plugins ########
+
+# Huggingface
+huggingface:
+  base_url: "https://api-inference.huggingface.co/models"
+  hub_url: "https://huggingface.co/api"
+  pii_api_url: "https://api-inference.huggingface.co/models/beki/en_spacy_pii_distilbert"
+  token:
+
+########
+
+## LLM plugins ########
+
+# Anthropic - ./plugins/llms/anthropic
+anthropic:
+  api_key:
+
+# Bedrock - ./plugins/llms/bedrock
+bedrock:
+  region:
+  access_key_id:
+  secret_access_key:
+  session_token:
+
+# Cohere - ./plugins/llms/cohere
+cohere:
+  api_key:
+
+# Gemini - ./plugins/llms/gemini
+gemini:
+  project_id:
+  project_location:
+  service_account_key_file:
+  learnlm_url:
+  api_key:
+
+# gpt4all - ./plugins/llms/gpt4all
+gpt4all:
+  api_url:
+
+# Llama 2 - ./plugins/llms/llama2
+llama2:
+  base_path:
+
+# Llama API - ./plugins/llms/llamaapi
+llamaapi:
+  base_path: "https://api.llama-api.com"
+  api_key:
+
+# LocalAI - ./plugins/llms/localai
+localai:
+  base_path:
+
+# Mistral - ./plugins/llms/mistral
+mistral:
+  api_url: ""
+  api_key: ""
+
+# OpenAI - ./plugins/llms/openai
+openai:
+  api_key:
+
+# Vertex AI - ./plugins/llms/vertexai
+google_vertex:
+  palm2_default_model: "models/text-bison-001"
+  api_key:
+
+########
+
+## Passport auth plugins ########
+
+# Keycloak - ./plugins/passport/keycloak
+keycloak:
+  host:
+  callback:
+  realm:
+  client_id:
+  client_secret:
+
+# localapikey - ./plugins/passport/localapikey
+system_api_key: ""
+token_store_key: "onetoks"
+
+########
+
+## SQL sources ########
+
+## BigQuery
+bigquery:
+  project_id:
+  key_filename:
+
+########
+
+## Tool plugins ########
+
+# Jira - ./plugins/tools/jira
+jira:
+  api_url:
+  email:
+  pat:
+  project_key:
+
+# Mailtrap - ./plugins/tools/email
+mailtrap:
+  template_uuid:
+  token:
+  sender_email:
+  invite_template_uuid"
+
+# OpenWeather - ./plugins/tools/openweather
+openweather:
+  api_key:
+
+# Playwright
+playwright:
+  workspace_id: "1"
+
+# SERP API - ./plugins/tools/serpapi
+serpapi:
+  api_url: "https://google.serper.dev/search"
+  api_key:
+
+# Trello
+trello:
+  api_token:
+
+########
+
+## Vector store plugins ########
+vector_stores:
+
+  # Chroma
+  chroma:
+    host:
+    token:
+
+  # Neo4j
+  neo4j:
+    host:
+    port:
+    username:
+    password:
+
+# RediSearch (default semantic index)
+vecsearch:
+  api_url:
+
+########
+
+stability_ai:
+  api_key: ""
+
+metricflow:
+  environment_id: ""
+  service_token: ""
+
+clickhouse:
+  url:
+  database:
+  username:
+  password:
+
+neo4j:
+  auth:
